@@ -1,146 +1,196 @@
-from typing import Annotated, Sequence, TypedDict, List
-import json
-from langchain_core.messages import BaseMessage
-from langgraph.graph.message import add_messages
-from langchain_core.messages import ToolMessage, SystemMessage, HumanMessage
-from langchain_core.runnables import RunnableConfig
-from langgraph.graph import StateGraph, END
-from langchain_core.tools import BaseTool
-from langchain_core.language_models.chat_models import BaseChatModel
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_anthropic import ChatAnthropic
+from typing import List
+from llama_index.core.workflow import (
+    step,
+    Context,
+    StartEvent,
+    StopEvent,
+    Workflow,
+)
+from llama_index.core.agent import FunctionCallingAgent
+from config import _Settings
+from qdrant.vector_db import QdrantManager
+from llama_index.core.tools import QueryEngineTool
+from agent.event import (
+    OutlineEvent,
+    QuestionEvent,
+    AnswerEvent,
+    ReviewEvent,
+    ProgressEvent,
+)
 
 
-class TokenCallbackHandler:
-    def __init__(self):
-        self.total_input_token = 0
-        self.total_output_token = 0
-
-    def update_total_tokens(self, input_token: int, output_token: int):
-        self.total_input_token += input_token
-        self.total_output_token += output_token
-
-    def get_tokens(self):
-        return self.total_input_token, self.total_output_token
-
-
-class AgentState(TypedDict):
-    """The state of the agent."""
-
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-    history_token: int
-    input_token: int
-    output_token: int
-
-
-class PhiAgent:
+class DocumentResearchAgent(Workflow):
     def __init__(
         self,
-        llm: BaseChatModel,
-        tools: List[BaseTool],
-        system_prompt: str,
+        file_paths=None,
+        similarity_top_k=10,
+        collection_name="documents",
+        *args,
+        **kwargs,
     ):
-        self.token_callback_handler = TokenCallbackHandler()
-        self.state_graph = StateGraph(input=AgentState, output=AgentState)
-        self.tools_by_name = {tool.name: tool for tool in tools}
-        self.llm_with_tools = llm.bind_tools(tools)
-        self.memory = MemorySaver()
-        self.setup_nodes()
-        self.setup_edges()
+        super().__init__(
+            *args, **kwargs
+        )  # Initialize parent class with all args and kwargs
+        self.file_paths = file_paths if file_paths is not None else []
+        self.similarity_top_k = similarity_top_k
+        self.collection_name = collection_name
+        self.Settings = _Settings
 
-        if isinstance(llm, ChatGoogleGenerativeAI):
-            self.system_prompt = HumanMessage(system_prompt)
-        else:
-            self.system_prompt = SystemMessage(system_prompt)
-
-        if isinstance(llm, ChatGoogleGenerativeAI):
-            self.provider = "google"
-        elif isinstance(llm, ChatAnthropic):
-            self.provider = "anthropic"
-        else:
-            self.provider = "openai"
-
-    def setup_nodes(self):
-        self.state_graph.add_node("agent", self.call_model)
-        self.state_graph.add_node("tools", self.tool_node)
-
-    def setup_edges(self):
-        self.state_graph.set_entry_point("agent")
-        self.state_graph.add_conditional_edges(
-            "agent",
-            self.should_continue,
-            {
-                "continue": "tools",
-                "end": END,
-            },
+        index = QdrantManager().create_or_load_index(
+            collection_name=self.collection_name, file_paths=self.file_paths
         )
-        self.state_graph.add_edge("tools", "agent")
-
-    async def tool_node(self, state: AgentState):
-        outputs = []
-
-        for tool_call in state["messages"][-1].tool_calls:
-            tool_result = await self.tools_by_name[tool_call["name"]].ainvoke(
-                tool_call["args"],
-            )
-            content = json.dumps(tool_result)
-            outputs.append(
-                ToolMessage(
-                    content=content[:30000],
-                    name=tool_call["name"],
-                    tool_call_id=tool_call["id"],
-                )
-            )
-
-        return {"messages": outputs}
-
-    def extract_token_metadata(self, response):
-        if self.provider == "google":
-            usage = response.usage_metadata
-            input_token = usage.get("input_tokens", 0)
-            output_token = usage.get("output_tokens", 0)
-
-        elif self.provider == "anthropic":
-            usage = response.usage_metadata
-            input_token = usage.get("input_tokens", 0)
-            output_token = usage.get("output_tokens", 0)
-
-        elif self.provider == "openai":
-            usage = response.usage_metadata
-            input_token = usage.get("input_tokens", 0)
-            output_token = usage.get("output_tokens", 0)
-
-        return input_token, output_token
-
-    async def call_model(self, state: AgentState, config: RunnableConfig):
-        response = await self.llm_with_tools.ainvoke(
-            [self.system_prompt] + state["messages"],
-            config=config,
+        query_engine = index.as_query_engine(similarity_top_k=self.similarity_top_k)
+        self.tool = QueryEngineTool.from_defaults(
+            query_engine,
+            name="document_retrieval_tool",
+            description=f"A RAG engine with extremely detailed information about the {str(self.file_paths)}",
         )
 
-        input_token, output_token = self.extract_token_metadata(response)
-        # print(str(response.__dict__))
+    # get the initial request and create an outline of the blog post knowing nothing about the topic
+    @step()
+    async def formulate_plan(self, ctx: Context, ev: StartEvent) -> OutlineEvent:
+        query = ev.query
+        await ctx.set("original_query", query)
+        await ctx.set("tools", ev.tools)
 
-        # Update sum of token
-        self.token_callback_handler.update_total_tokens(input_token, output_token)
-        return {
-            "messages": [response],
-            "input_token": input_token,
-            "output_token": output_token,
-        }
+        prompt = f"""You are an expert at writing blog posts. You have been given a topic to write
+        a blog post about. Plan an outline for the blog post; it should be detailed and specific.
+        Another agent will formulate questions to find the facts necessary to fulfill the outline.
+        The topic is: {query}"""
 
-    def should_continue(self, state: AgentState):
-        messages = state["messages"]
-        last_message = messages[-1]
-        return "end" if not last_message.tool_calls else "continue"
+        response = await self.Settings.llm.acomplete(prompt)
 
-    def compile(self):
-        compiler = self.state_graph.compile(checkpointer=self.memory)
-        compiler.token_callback_handler = self.token_callback_handler
-        return compiler
+        ctx.write_event_to_stream(ProgressEvent(progress="Outline:\n" + str(response)))
 
+        return OutlineEvent(outline=str(response))
 
-if __name__ == "__main__":
-    agent_instance = PhiAgent()
-    agent_graph = agent_instance.compile()
+    # formulate some questions based on the outline
+    @step()
+    async def formulate_questions(
+        self, ctx: Context, ev: OutlineEvent
+    ) -> QuestionEvent:
+        outline = ev.outline
+        await ctx.set("outline", outline)
+
+        prompt = f"""You are an expert at formulating research questions. You have been given an outline
+        for a blog post. Formulate a series of simple questions that will get you the facts necessary
+        to fulfill the outline. You cannot assume any existing knowledge; you must ask at least one
+        question for every bullet point in the outline. Avoid complex or multi-part questions; break
+        them down into a series of simple questions. Your output should be a list of questions, each
+        on a new line. Do not include headers or categories or any preamble or explanation; just a
+        list of questions. For speed of response, limit yourself to 8 questions. The outline is: {outline}"""
+
+        response = await self.Settings.llm.acomplete(prompt)
+
+        questions = str(response).split("\n")
+        questions = [x for x in questions if x]
+
+        ctx.write_event_to_stream(
+            ProgressEvent(progress="Formulated questions:\n" + "\n".join(questions))
+        )
+
+        await ctx.set("num_questions", len(questions))
+
+        ctx.write_event_to_stream(
+            ProgressEvent(progress="Questions:\n" + "\n".join(questions))
+        )
+
+        for question in questions:
+            ctx.send_event(QuestionEvent(question=question))
+
+    # answer each question in turn
+    @step()
+    async def answer_question(self, ctx: Context, ev: QuestionEvent) -> AnswerEvent:
+        question = ev.question
+        if not question or question.isspace() or question == "" or question is None:
+            ctx.write_event_to_stream(
+                ProgressEvent(progress=f"Skipping empty question.")
+            )  # Log skipping empty question
+            return None
+        agent = FunctionCallingAgent.from_tools(
+            await ctx.get("tools"),
+            verbose=True,
+        )
+        response = await agent.aquery(question)
+
+        ctx.write_event_to_stream(
+            ProgressEvent(
+                progress=f"To question '{question}' the agent answered: {response}"
+            )
+        )
+
+        return AnswerEvent(question=question, answer=str(response))
+
+    # given all the answers to all the questions and the outline, write the blog poost
+    @step()
+    async def write_report(self, ctx: Context, ev: AnswerEvent) -> ReviewEvent:
+        # wait until we receive as many answers as there are questions
+        num_questions = await ctx.get("num_questions")
+        results = ctx.collect_events(ev, [AnswerEvent] * num_questions)
+        if results is None:
+            return None
+
+        # maintain a list of all questions and answers no matter how many times this step is called
+        try:
+            previous_questions = await ctx.get("previous_questions")
+        except:
+            previous_questions = []
+        previous_questions.extend(results)
+        await ctx.set("previous_questions", previous_questions)
+
+        prompt = f"""You are an expert at writing blog posts. You are given an outline of a blog post
+        and a series of questions and answers that should provide all the data you need to write the
+        blog post. Compose the blog post according to the outline, using only the data given in the
+        answers. The outline is in <outline> and the questions and answers are in <questions> and
+        <answers>.
+        <outline>{await ctx.get("outline")}</outline>"""
+
+        for result in previous_questions:
+            prompt += f"<question>{result.question}</question>\n<answer>{result.answer}</answer>\n"
+
+        ctx.write_event_to_stream(
+            ProgressEvent(progress="Writing report with prompt:\n" + prompt)
+        )
+
+        report = await self.Settings.llm.acomplete(prompt)
+
+        return ReviewEvent(report=str(report))
+
+    # review the report. If it still needs work, formulate some more questions.
+    @step
+    async def review_report(
+        self, ctx: Context, ev: ReviewEvent
+    ) -> StopEvent | QuestionEvent:
+        # we re-review a maximum of 3 times
+        try:
+            num_reviews = await ctx.get("num_reviews")
+        except:
+            num_reviews = 1
+        num_reviews += 1
+        await ctx.set("num_reviews", num_reviews)
+
+        report = ev.report
+
+        prompt = f"""You are an expert reviewer of blog posts. You are given an original query,
+        and a blog post that was written to satisfy that query. Review the blog post and determine
+        if it adequately answers the query and contains enough detail. If it doesn't, come up with
+        a set of questions that will get you the facts necessary to expand the blog post. Another
+        agent will answer those questions. Your response should just be a list of questions, one
+        per line, without any preamble or explanation. For speed, generate a maximum of 4 questions.
+        The original query is: '{await ctx.get("original_query")}'.
+        The blog post is: <blogpost>{report}</blogpost>.
+        If the blog post is fine, return just the string 'OKAY'."""
+
+        response = await self.Settings.llm.acomplete(prompt)
+
+        if response == "OKAY" or await ctx.get("num_reviews") >= 3:
+            ctx.write_event_to_stream(ProgressEvent(progress="Blog post is fine"))
+            return StopEvent(result=report)
+        else:
+            questions = str(response).split("\n")
+            await ctx.set("num_questions", len(questions))
+            ctx.write_event_to_stream(
+                ProgressEvent(progress="Formulated some more questions")
+            )
+            for question in questions:
+                ctx.send_event(QuestionEvent(question=question))

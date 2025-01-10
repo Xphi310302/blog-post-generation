@@ -1,3 +1,3 @@
-from .base import PhiAgent
+from .base import DocumentResearchAgent
 
-__all__ = ["PhiAgent"]
+__all__ = ["DocumentResearchAgent"]
