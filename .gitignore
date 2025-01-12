@@ -9,4 +9,5 @@ build/
 *.log
 .env
 *.ipynb
+.venv
 # End of Selection
